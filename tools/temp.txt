@@ -1,0 +1,1040 @@
+
+File: ./cholera_processor.py
+
+#!/usr/bin/env python3
+"""
+cholera_processor.py --- Processes cholera death records by copying PDFs and updating a JSON file.
+Version: 1.2.0
+"""
+
+import os
+import json
+import shutil
+
+GLOBAL_FILE = "./data/complete_data.json"
+
+def process_cholera_deaths():
+    """
+    Processes the complete_data.json to filter out cholera death records,
+    ensures that the ./cholera_positive directory contains only the PDFs corresponding
+    to current cholera-positive records, copies any missing PDFs from ./death_certificates/,
+    and overwrites the JSON file at ./data/cholera_deaths.json with the updated records.
+    """
+    cholera_pdf_dir = "./cholera_positive"
+    os.makedirs(cholera_pdf_dir, exist_ok=True)
+
+    # Load the complete_data.json file
+    try:
+        with open(GLOBAL_FILE, "r") as f:
+            complete_data = json.load(f)
+    except Exception as e:
+        print("Error reading complete_data.json:", e)
+        return
+
+    # Filter records with cholera_death == "yes" (case-insensitive)
+    cholera_records = [
+        record for record in complete_data
+        if record.get("cholera_death", "").lower() == "yes"
+    ]
+
+    # Build a set of valid base filenames from cholera_records
+    valid_filenames = {record.get("filename", "") for record in cholera_records}
+
+    # Remove any PDFs in cholera_pdf_dir that are not in the valid set
+    for file in os.listdir(cholera_pdf_dir):
+        if file.lower().endswith(".pdf"):
+            base_filename = file[:-4]  # remove ".pdf"
+            if base_filename not in valid_filenames:
+                file_to_remove = os.path.join(cholera_pdf_dir, file)
+                try:
+                    os.remove(file_to_remove)
+                    print(f"Removed outdated file: {file_to_remove}")
+                except Exception as e:
+                    print(f"Error removing file {file_to_remove}: {e}")
+
+    # Copy the PDF files for cholera death records if they don't already exist
+    for record in cholera_records:
+        pdf_filename = record.get("filename", "") + ".pdf"  # Assumes PDF filenames follow this convention
+        src_path = os.path.join("./death_certificates", pdf_filename)
+        dst_path = os.path.join(cholera_pdf_dir, pdf_filename)
+        if not os.path.exists(src_path):
+            print(f"Source PDF not found: {src_path}")
+            continue
+        if os.path.exists(dst_path):
+            print(f"PDF already exists, skipping: {dst_path}")
+        else:
+            try:
+                shutil.copy2(src_path, dst_path)
+                print(f"Copied {src_path} to {dst_path}")
+            except Exception as e:
+                print(f"Error copying {src_path} to {dst_path}: {e}")
+
+    # Overwrite the JSON file with the updated cholera records
+    cholera_json_path = "./data/cholera_deaths.json"
+    try:
+        with open(cholera_json_path, "w") as f:
+            json.dump(cholera_records, f, indent=4)
+        print(f"Cholera JSON file updated: {cholera_json_path}")
+    except Exception as e:
+        print(f"Error writing {cholera_json_path}: {e}")
+
+if __name__ == "__main__":
+    process_cholera_deaths()
+
+
+
+File: ./deepseek_cholera_request.py
+
+#!/usr/bin/env python3
+"""
+deepseek_cholera_request.py --- Determines if cause of death is related to cholera via fuzzy keyword search.
+Version: 1.3.0
+
+Processes deepseek_response.json one record at a time, checking the cause_of_death for cholera-related keywords
+using fuzzy matching to account for minor misspellings, and adds the cause_of_death and cholera_death result ('yes', 'no', or 'unknown') to the output.
+"""
+
+import os
+import json
+import re
+import difflib
+from global_updater import update_global_file
+
+def ensure_directory_exists(file_path):
+    directory = os.path.dirname(file_path)
+    if directory and not os.path.exists(directory):
+        os.makedirs(directory, exist_ok=True)
+
+def load_json_data(file_path):
+    if os.path.exists(file_path):
+        with open(file_path, "r", encoding="utf-8") as file:
+            try:
+                return json.load(file)
+            except json.JSONDecodeError:
+                return []
+    return []
+
+def save_responses(response_data, file_path):
+    ensure_directory_exists(file_path)
+    with open(file_path, "w", encoding="utf-8") as out_file:
+        json.dump(response_data, out_file, indent=2)
+
+def fuzzy_in_text(keyword, text, threshold=0.8):
+    """
+    Returns True if the keyword is found in the text either as an exact substring
+    or if any token in the text is similar to the keyword based on the given threshold.
+    """
+    # Exact substring check
+    if keyword in text:
+        return True
+
+    # Tokenize text by non-word characters (ignores punctuation)
+    words = re.split(r'\W+', text)
+    for word in words:
+        if difflib.SequenceMatcher(None, word, keyword).ratio() >= threshold:
+            return True
+    return False
+
+def check_cholera_keywords(cause):
+    """
+    Check the cause_of_death string for cholera-related keywords using fuzzy matching.
+    
+    Returns:
+        'yes' if a cholera keyword is found,
+        'no' if any negative keyword is found,
+        'unknown' if none of the keywords are found.
+    """
+    if not cause:
+        return "unknown"
+    cause_lower = cause.lower()
+    
+    # Negative keywords that indicate the death is not related to cholera.
+    negative_keywords = [
+        "hanging", "convulsions", "head injury", "typhoid fever", "diptheria", "epilepsy", "old age"
+    ]
+    for neg in negative_keywords:
+        if fuzzy_in_text(neg, cause_lower, threshold=0.8):
+            return "no"
+    
+    # Positive keywords that indicate cholera-related death.
+    positive_keywords = [
+        "cholera", "asiatic cholera", "cholera morbus", "cholera infantum",
+        "chronic diarrhea", "diarrhoea", "diarrhea", "vomiting", "exhaustion"
+    ]
+    for pos in positive_keywords:
+        if fuzzy_in_text(pos, cause_lower, threshold=0.8):
+            return "yes"
+    
+    return "unknown"
+
+def main():
+    input_file = "./deepseek/deepseek_response.json"
+    output_file = "./deepseek/deepseek_yes_no_response.json"
+
+    deepseek_records = load_json_data(input_file)
+    yes_no_responses = load_json_data(output_file)
+
+    processed_files = {entry.get("filename") for entry in yes_no_responses if "filename" in entry}
+
+    for record in deepseek_records:
+        filename = record.get("filename")
+        if not filename:
+            continue
+        if filename in processed_files:
+            print(f"Skipping already processed file: {filename}")
+            continue
+
+        print(f"Processing cholera check for file: {filename}")
+        cause = record.get("cause_of_death", "")
+        cholera_death = check_cholera_keywords(cause)
+
+        output_entry = {
+            "filename": filename,
+            "cause_of_death": cause,
+            "cholera_death": cholera_death
+        }
+
+        yes_no_responses.append(output_entry)
+        processed_files.add(filename)
+
+        save_responses(yes_no_responses, output_file)
+        update_global_file(output_file)
+
+        print(f"Cholera check response for {filename} saved.")
+
+if __name__ == "__main__":
+    main()
+
+
+
+File: ./deepseek_name_request.py
+
+#!/usr/bin/env python3
+"""
+deepseek_name_request.py --- Extracts person's name from the OCR text via Deepseek model.
+Version: 1.0.1
+
+Reads OCR data from ./ocr/transcribed_json.json, sends a prompt to the Deepseek model
+to identify only the person's name of the deceased, and saves results to
+./deepseek/deepseek_names.json, then updates the global data file.
+"""
+
+import os
+import json
+import requests
+from global_updater import update_global_file
+
+def ensure_directory_exists(file_path):
+    directory = os.path.dirname(file_path)
+    if directory and not os.path.exists(directory):
+        os.makedirs(directory, exist_ok=True)
+
+def load_ocr_data(ocr_file_path):
+    with open(ocr_file_path, "r", encoding="utf-8") as file:
+        return json.load(file)
+
+def load_deepseek_name_responses(response_file_path):
+    if os.path.exists(response_file_path):
+        with open(response_file_path, "r", encoding="utf-8") as file:
+            try:
+                return json.load(file)
+            except json.JSONDecodeError:
+                return []
+    return []
+
+def build_name_prompt(ocr_record):
+    ocr_data_str = json.dumps(ocr_record.get("ocr_text", ""), indent=2)
+    prompt = (
+        "Extract the full name of the deceased. Look for: Name of the deceased (in full): [Name]."
+        "Return a JSON array with one object containing exactly the key: 'person_name'. "
+        "Do not add explanations or extra text. No yapping.\n\n"
+        "OCR TEXT:\n" + ocr_data_str
+    )
+    return prompt
+
+def build_json_schema():
+    return {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "person_name": {"type": "string"}
+            },
+            "required": ["person_name"]
+        }
+    }
+
+def send_generate_request(payload, url):
+    response = requests.post(url, json=payload)
+    response.raise_for_status()
+    return response.json()
+
+def parse_model_response(api_result):
+    raw_response = api_result.get("response", "").strip()
+    try:
+        return json.loads(raw_response)
+    except json.JSONDecodeError as e:
+        print("Failed to parse the 'response' field as JSON:", e)
+        return raw_response
+
+def save_name_responses(response_data, response_file_path):
+    ensure_directory_exists(response_file_path)
+    with open(response_file_path, "w", encoding="utf-8") as out_file:
+        json.dump(response_data, out_file, indent=2)
+
+def main():
+    ocr_file_path = "./ocr/transcribed_json.json"
+    response_file_path = "./deepseek/deepseek_names.json"
+
+    ocr_data = load_ocr_data(ocr_file_path)
+    name_responses = load_deepseek_name_responses(response_file_path)
+
+    # 1) Remove any duplicates in name_responses itself (if they exist from older runs).
+    unique_entries = {}
+    for entry in name_responses:
+        filename = entry.get("filename")
+        if filename and filename not in unique_entries:
+            unique_entries[filename] = entry
+    name_responses = list(unique_entries.values())
+
+    # 2) Build a set of already-processed filenames
+    processed_files = {entry.get("filename") for entry in name_responses if "filename" in entry}
+
+    url = "http://127.0.0.1:11434/api/generate"
+    json_schema = build_json_schema()
+
+    for record in ocr_data:
+        filename = record.get("filename")
+        if not filename:
+            continue
+        if filename in processed_files:
+            print(f"Skipping already processed file: {filename}")
+            continue
+
+        print(f"Extracting name for file: {filename}")
+        prompt = build_name_prompt(record)
+        payload = {
+            "model": "deepseek-r1:32b",
+            "prompt": prompt,
+            "stream": False,
+            "format": json_schema
+        }
+
+        try:
+            api_result = send_generate_request(payload, url)
+            parsed_response = parse_model_response(api_result)
+
+            if isinstance(parsed_response, list) and len(parsed_response) > 0:
+                result_obj = parsed_response[0]
+            elif isinstance(parsed_response, dict):
+                result_obj = parsed_response
+            else:
+                result_obj = {}
+
+            output_entry = {
+                "filename": filename,
+                "person_name": result_obj.get("person_name", "")
+            }
+
+            name_responses.append(output_entry)
+            processed_files.add(filename)
+
+            # Save to deepseek_names.json
+            save_name_responses(name_responses, response_file_path)
+            # Update the global file
+            update_global_file(response_file_path)
+
+            print(f"Name extraction for {filename} saved.")
+        except requests.exceptions.RequestException as e:
+            print(f"An error occurred while sending the request for file {filename}: {e}")
+        except Exception as e:
+            print(f"An unexpected error occurred for file {filename}: {e}")
+
+if __name__ == "__main__":
+    main()
+
+
+
+File: ./deepseek_request.py
+
+#!/usr/bin/env python3
+"""
+deepseek_request.py --- Sends an HTTP request to the Deepseek model via Ollama,
+extracting structured response for death_date, death_location, and cause_of_death.
+Version: 1.1.4
+"""
+
+import os
+import json
+import requests
+from global_updater import update_global_file
+
+def ensure_directory_exists(file_path):
+    directory = os.path.dirname(file_path)
+    if directory and not os.path.exists(directory):
+        os.makedirs(directory, exist_ok=True)
+
+def load_ocr_data(ocr_file_path):
+    with open(ocr_file_path, "r", encoding="utf-8") as file:
+        return json.load(file)
+
+def load_deepseek_responses(response_file_path):
+    if os.path.exists(response_file_path):
+        with open(response_file_path, "r", encoding="utf-8") as file:
+            try:
+                return json.load(file)
+            except json.JSONDecodeError:
+                return []
+    return []
+
+def build_prompt(ocr_record):
+    ocr_data_str = json.dumps(ocr_record, indent=2)
+    prompt = (
+        "Extract the following details from the OCR record (if available):\n"
+        "1. death_date, write the death date in Month Day, Year -- it should be between 1865 and 1867\n"
+        "2. death_location, write a specific location or address of death\n"
+        "3. cause_of_death, write a specific and succinct cause of death\n\n"
+        "Return a JSON array with one object containing exactly these keys:\n"
+        "  - death_date\n"
+        "  - death_location\n"
+        "  - cause_of_death\n\n"
+        "Do not include any extra text. Be succinct and concise.\n\n"
+        "OCR Record:\n" + ocr_data_str
+    )
+    return prompt
+
+def build_json_schema():
+    return {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "death_date": {"type": "string"},
+                "death_location": {"type": "string"},
+                "cause_of_death": {"type": "string"}
+            },
+            "required": ["death_date", "death_location", "cause_of_death"]
+        }
+    }
+
+def send_generate_request(payload, url):
+    response = requests.post(url, json=payload)
+    response.raise_for_status()
+    return response.json()
+
+def parse_model_response(api_result):
+    raw_response = api_result.get("response", "").strip()
+    try:
+        parsed_response = json.loads(raw_response)
+        return parsed_response
+    except json.JSONDecodeError as e:
+        print("Failed to parse the 'response' field as JSON:", e)
+        return raw_response
+
+def save_responses(response_data, response_file_path):
+    ensure_directory_exists(response_file_path)
+    with open(response_file_path, "w", encoding="utf-8") as out_file:
+        json.dump(response_data, out_file, indent=2)
+
+def main():
+    ocr_file_path = "./ocr/transcribed_json.json"
+    response_file_path = "./deepseek/deepseek_response.json"
+
+    ocr_data = load_ocr_data(ocr_file_path)
+    deepseek_responses = load_deepseek_responses(response_file_path)
+    processed_files = {entry.get("filename") for entry in deepseek_responses if "filename" in entry}
+
+    url = "http://127.0.0.1:11434/api/generate"
+    json_schema = build_json_schema()
+
+    for record in ocr_data:
+        filename = record.get("filename")
+        if not filename:
+            continue
+        if filename in processed_files:
+            print(f"Skipping already processed file: {filename}")
+            continue
+
+        print(f"Processing OCR for file: {filename}")
+        prompt = build_prompt(record)
+        payload = {
+            "model": "deepseek-r1:32b",
+            "prompt": prompt,
+            "stream": False,
+            "format": json_schema
+        }
+
+        try:
+            api_result = send_generate_request(payload, url)
+            parsed_response = parse_model_response(api_result)
+            if isinstance(parsed_response, list) and len(parsed_response) > 0:
+                result_obj = parsed_response[0]
+            elif isinstance(parsed_response, dict):
+                result_obj = parsed_response
+            else:
+                result_obj = {}
+
+            ordered_result = {
+                "filename": filename,
+                "death_date": result_obj.get("death_date", ""),
+                "death_location": result_obj.get("death_location", ""),
+                "cause_of_death": result_obj.get("cause_of_death", "")
+            }
+
+            deepseek_responses.append(ordered_result)
+            processed_files.add(filename)
+
+            save_responses(deepseek_responses, response_file_path)
+            # Immediately update the global file
+            update_global_file(response_file_path)
+
+            print(f"Deepseek response for {filename} saved.")
+        except requests.exceptions.RequestException as e:
+            print(f"An error occurred while sending the request for file {filename}: {e}")
+        except Exception as e:
+            print(f"An unexpected error occurred for file {filename}: {e}")
+
+if __name__ == "__main__":
+    main()
+
+
+
+File: ./document_ai_processor.py
+
+#!/usr/bin/env python3
+"""
+document_ai_processor.py --- Process PDFs with Document AI and save OCR results.
+Version: 1.1.2
+
+This script reads PDF files from the './death_certificates' directory,
+sends them to a Document AI endpoint for OCR, and saves the result to
+'./ocr/transcribed_json.json'. Then updates the global file.
+"""
+
+import os
+import base64
+import json
+import requests
+import google.auth
+import google.auth.transport.requests
+from global_updater import update_global_file
+
+def get_access_token():
+    credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+    auth_req = google.auth.transport.requests.Request()
+    credentials.refresh(auth_req)
+    return credentials.token
+
+def process_pdf(file_path, access_token, endpoint_url):
+    with open(file_path, "rb") as f:
+        file_content = f.read()
+    encoded_content = base64.b64encode(file_content).decode("utf-8")
+
+    payload = {
+        "rawDocument": {
+            "content": encoded_content,
+            "mimeType": "application/pdf"
+        }
+    }
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+
+    response = requests.post(endpoint_url, headers=headers, json=payload)
+    if response.status_code != 200:
+        print(f"Error processing {file_path}: {response.status_code} - {response.text}")
+        return None
+
+    response_data = response.json()
+    ocr_text = response_data.get("document", {}).get("text", "")
+    return ocr_text
+
+def main():
+    endpoint_url = "https://us-documentai.googleapis.com/v1/projects/66601296107/locations/us/processors/b33f41abbc1016f2:process"
+    directory = "./death_certificates"
+    output_dir = "./ocr"
+    os.makedirs(output_dir, exist_ok=True)
+    output_file = os.path.join(output_dir, "transcribed_json.json")
+
+    existing_results = []
+    processed_files = set()
+    if os.path.exists(output_file):
+        with open(output_file, "r", encoding="utf-8") as f:
+            try:
+                existing_results = json.load(f)
+                processed_files = {os.path.splitext(item.get("filename", ""))[0] for item in existing_results}
+            except json.JSONDecodeError:
+                existing_results = []
+
+    access_token = get_access_token()
+    all_results = existing_results[:]
+
+    for filename in os.listdir(directory):
+        if filename.lower().endswith(".pdf"):
+            file_base = os.path.splitext(filename)[0]
+            if file_base in processed_files:
+                print(f"Skipping already processed file: {file_base}")
+                continue
+
+            file_path = os.path.join(directory, filename)
+            print(f"Processing file: {filename}")
+            ocr_text = process_pdf(file_path, access_token, endpoint_url)
+            if ocr_text is not None:
+                print("Filename:", file_base)
+                print("OCR Text:")
+                print(ocr_text)
+                print("=" * 50)
+                result = {
+                    "filename": file_base,
+                    "ocr_text": ocr_text
+                }
+                all_results.append(result)
+                processed_files.add(file_base)
+
+                # Write to transcribed_json.json
+                with open(output_file, "w", encoding="utf-8") as f:
+                    json.dump(all_results, f, indent=4)
+
+                # Update the global file
+                update_global_file(output_file)
+
+    print(f"OCR results saved to {output_file}")
+
+if __name__ == "__main__":
+    main()
+
+
+
+File: ./global_updater.py
+
+#!/usr/bin/env python3
+"""
+global_updater.py --- Utility to update the global data file.
+Version: 1.0.0
+
+This module centralizes the logic needed to load, merge, and save updates
+to a global JSON file that holds consolidated data from other scripts.
+"""
+
+import os
+import json
+
+GLOBAL_FILE = "./data/complete_data.json"
+
+def load_json(file_path):
+    if os.path.exists(file_path):
+        with open(file_path, "r", encoding="utf-8") as f:
+            try:
+                return json.load(f)
+            except json.JSONDecodeError:
+                return []
+    return []
+
+def save_json(data, file_path):
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4)
+
+def merge_records(existing, new, key_field="filename", rename_key=None):
+    """
+    Merge a list of new records into the existing dictionary (keyed by filename).
+    Optionally rename a key from the new records (e.g., 'output filename' -> 'filename').
+    """
+    for record in new:
+        if rename_key and rename_key in record:
+            record["filename"] = record.pop(rename_key)
+        fname = record.get("filename")
+        if not fname:
+            continue
+
+        if fname in existing:
+            existing[fname].update(record)
+        else:
+            # Initialize known keys with empty strings for consistency.
+            merged = {
+                "filename": fname,
+                "person_name": "",
+                "certificate_url": "",
+                "ocr_text": "",
+                "death_date": "",
+                "death_location": "",
+                "cause_of_death": "",
+                "cholera_death": ""
+            }
+            merged.update(record)
+            existing[fname] = merged
+    return existing
+
+def update_global_file(source_file, rename_key=None):
+    """
+    Loads data from a source JSON file, merges it into the global complete_data.json,
+    and writes the updated data back out.
+    """
+    global_data = load_json(GLOBAL_FILE)
+    global_dict = {entry.get("filename"): entry for entry in global_data if entry.get("filename")}
+
+    source_data = load_json(source_file)
+    updated_dict = merge_records(global_dict, source_data, rename_key=rename_key)
+
+    merged_list = list(updated_dict.values())
+    save_json(merged_list, GLOBAL_FILE)
+    print(f"[global_updater] Updated global file from {source_file}")
+
+
+
+File: ./historical_vital_records_downloader.py
+
+#!/usr/bin/env python3
+"""
+historical_vital_records_downloader.py --- A modular Selenium-based scraper
+for downloading PDF files from historical vital records websites.
+Version: 1.1.7
+
+This script now allows easy configuration for borough (county), certificate type,
+and year range. Modify the BOROUGH, CERT_TYPE, START_YEAR, and END_YEAR at the top of
+the file as needed, and the BASE_URL will adjust automatically.
+"""
+
+import os
+import time
+import logging
+import json
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.service import Service
+from global_updater import update_global_file
+
+# -----------------------------
+# Configuration
+# -----------------------------
+MAX_FILES = 1  # Set to 1, 50, or 0/None for no limit
+CERTIFICATES_PER_PAGE = None  # Positive int for limit; 0/None => process all
+MAX_PAGES = 1  # 0/None for no limit
+
+BOROUGH = "manhattan"   # e.g., "manhattan", "kings", "queens", "bronx", "richmond"
+START_YEAR = 1865
+END_YEAR = 1867
+CERT_TYPE = "death"     # "birth", "death", or "marriage"
+
+BASE_URL_TEMPLATE = (
+    "https://a860-historicalvitalrecords.nyc.gov/browse-all?"
+    "year=&number=&last_name=&first_name=&page=&certificate_type={cert_type}&"
+    "year_range={start_year}+to+{end_year}&county={borough}"
+)
+BASE_URL = BASE_URL_TEMPLATE.format(
+    cert_type=CERT_TYPE,
+    start_year=START_YEAR,
+    end_year=END_YEAR,
+    borough=BOROUGH
+)
+
+RECORDS_FILE = './records/saved_files.json'
+
+
+def load_records():
+    os.makedirs(os.path.dirname(RECORDS_FILE), exist_ok=True)
+    if os.path.exists(RECORDS_FILE):
+        with open(RECORDS_FILE, 'r') as f:
+            try:
+                return json.load(f)
+            except json.JSONDecodeError:
+                return []
+    return []
+
+
+def save_record(record):
+    records = load_records()
+    records.append(record)
+    with open(RECORDS_FILE, 'w') as f:
+        json.dump(records, f, indent=4)
+
+    # Immediately update global file using rename_key="output filename"
+    update_global_file(RECORDS_FILE, rename_key="output filename")
+
+
+def already_downloaded(file_name):
+    records = load_records()
+    return any(record.get("output filename") == file_name for record in records)
+
+
+# Plugin registry for scraper modules
+SCRAPER_PLUGINS = {}
+
+
+def register_scraper(name):
+    """
+    Decorator to register a scraper plugin.
+    """
+    def decorator(cls):
+        SCRAPER_PLUGINS[name] = cls
+        return cls
+    return decorator
+
+
+class BaseScraper:
+    """
+    BaseScraper is an abstract class defining the interface for all scraper plugins.
+    """
+    def __init__(self, download_dir='downloads', driver_path=None):
+        self.download_dir = os.path.abspath(download_dir)
+        os.makedirs(self.download_dir, exist_ok=True)
+        self.driver = None
+        self.wait = None
+        self.driver_path = driver_path
+        self.download_count = 0
+        self.setup_driver()
+
+    def setup_driver(self):
+        raise NotImplementedError("setup_driver must be implemented by subclasses.")
+
+    def scrape(self):
+        raise NotImplementedError("scrape must be implemented by subclasses.")
+
+    def close(self):
+        if self.driver:
+            try:
+                self.driver.quit()
+            except Exception as e:
+                logging.info(f"Driver quit encountered an error: {e}")
+
+
+@register_scraper("nyc_death_certificate")
+class NYCDeathCertificateScraper(BaseScraper):
+    """
+    NYCDeathCertificateScraper scrapes the NYC historical vital records website
+    to download certificate PDFs (default is death, but can be changed).
+    """
+    def setup_driver(self):
+        chrome_options = Options()
+        prefs = {
+            "download.default_directory": self.download_dir,
+            "download.prompt_for_download": False,
+            "download.directory_upgrade": True,
+            "plugins.always_open_pdf_externally": True
+        }
+        chrome_options.add_experimental_option("prefs", prefs)
+        chrome_options.add_experimental_option("excludeSwitches", ["enable-logging"])
+
+        if self.driver_path:
+            service = Service(self.driver_path)
+        else:
+            service = Service("chromedriver")
+        self.driver = webdriver.Chrome(service=service, options=chrome_options)
+        self.wait = WebDriverWait(self.driver, 20)
+
+    def wait_for_downloads_complete(self, timeout=60):
+        elapsed = 0
+        while elapsed < timeout:
+            if not any(fname.endswith(".crdownload") for fname in os.listdir(self.download_dir)):
+                logging.info("Download complete.")
+                return True
+            time.sleep(1)
+            elapsed += 1
+        logging.warning("Download did not complete within the timeout period.")
+        return False
+
+    def scrape(self):
+        logging.info(f"Navigating to starting URL: {BASE_URL}")
+        self.driver.get(BASE_URL)
+        current_page = 1  # Start from page 1
+
+        try:
+            while True:
+                # Check if we've exceeded MAX_PAGES (if set)
+                if MAX_PAGES and current_page > MAX_PAGES:
+                    logging.info("Reached maximum page limit.")
+                    break
+
+                time.sleep(2)  # Let the page load fully
+                total_downloads = len(load_records())
+                logging.info(f"Currently on page {current_page}. Total downloaded so far: {total_downloads}")
+
+                certificate_blocks = self.driver.find_elements(By.XPATH, "//div[contains(@class, 'col-lg')]")
+                logging.info(f"Found {len(certificate_blocks)} certificate blocks on page {current_page}.")
+
+                if CERTIFICATES_PER_PAGE and CERTIFICATES_PER_PAGE > 0:
+                    certificate_blocks = certificate_blocks[:CERTIFICATES_PER_PAGE]
+
+                for block in certificate_blocks:
+                    try:
+                        detail_link_elem = block.find_element(By.XPATH, ".//a[contains(@href, '/view/')]")
+                        detail_url = detail_link_elem.get_attribute("href")
+                        file_name = block.find_element(By.XPATH, ".//h3[@class='small']").text.strip()
+
+                        if already_downloaded(file_name):
+                            logging.info(f"Skipping already downloaded certificate: {file_name}")
+                            continue
+
+                        if MAX_FILES and self.download_count >= MAX_FILES:
+                            logging.info("Reached maximum download limit.")
+                            return
+
+                        self.download_certificate(detail_url, file_name)
+
+                        # Log info after each file download
+                        logging.info(f"Downloaded file '{file_name}' from page {current_page}. "
+                                     f"Total downloaded so far: {len(load_records())}")
+
+                    except Exception as e:
+                        logging.error(f"Error processing certificate block: {e}")
+
+                self.wait_for_downloads_complete(timeout=60)
+
+                # Attempt to go to the next page
+                try:
+                    next_button = self.wait.until(
+                        EC.element_to_be_clickable((By.XPATH, "//a[@aria-label='Next']"))
+                    )
+                    logging.info(f"Finished page {current_page}; navigating to page {current_page + 1}...")
+                    next_button.click()
+                    time.sleep(3)
+                    current_page += 1
+                except Exception:
+                    logging.info("No 'Next' button found or an error occurred. Ending pagination.")
+                    break
+        except KeyboardInterrupt:
+            logging.info("Scraping interrupted by user.")
+        finally:
+            total_downloads_final = len(load_records())
+            logging.info(f"Scraping finished. Total certificates downloaded: {total_downloads_final}")
+
+    def download_certificate(self, url, file_name):
+        logging.info(f"Opening certificate URL: {url}")
+        self.driver.execute_script("window.open(arguments[0]);", url)
+        try:
+            self.driver.switch_to.window(self.driver.window_handles[-1])
+        except Exception as e:
+            logging.error(f"Error switching to new tab: {e}")
+            return
+        try:
+            pdf_link_elem = self.wait.until(
+                EC.presence_of_element_located((By.ID, "blob-url"))
+            )
+            pdf_url = pdf_link_elem.get_attribute("href")
+            logging.info(f"Found PDF URL: {pdf_url}. Navigating to download.")
+            self.driver.get(pdf_url)
+            self.download_count += 1
+            time.sleep(2)
+            self.wait_for_downloads_complete(timeout=60)
+
+            record = {
+                "output filename": file_name,
+                "certificate_url": url
+            }
+            save_record(record)
+        except KeyboardInterrupt:
+            logging.info("Download interrupted by user during certificate processing.")
+            raise
+        except Exception as e:
+            logging.error(f"Error retrieving PDF link for {url}: {e}")
+        finally:
+            try:
+                if len(self.driver.window_handles) > 1:
+                    self.driver.close()
+                    self.driver.switch_to.window(self.driver.window_handles[0])
+            except Exception as e:
+                if "connection" in str(e).lower():
+                    logging.info("Driver already disconnected, skipping tab close.")
+                else:
+                    logging.info(f"Error closing tab: {e}")
+
+
+def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+    scraper = NYCDeathCertificateScraper(
+        download_dir='./death_certificates',
+        driver_path='chromedriver.exe'
+    )
+    try:
+        scraper.scrape()
+    except KeyboardInterrupt:
+        logging.info("Process interrupted by user. Exiting.")
+    finally:
+        scraper.close()
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+File: ./pipeline.py
+
+#!/usr/bin/env python3
+"""
+pipeline.py --- Runs the full processing pipeline sequentially by importing modules,
+updates the global complete_data.json, and calls the cholera processing module.
+Version: 1.0.5
+"""
+
+import importlib
+import os
+import json
+import time
+import traceback
+from global_updater import update_global_file
+import cholera_processor  # Import the separate cholera processing module
+
+# File paths for the various outputs
+SAVED_FILES = "./records/saved_files.json"                       # Output from historical_vital_records_downloader.py
+OCR_JSON = "./ocr/transcribed_json.json"                         # Output from document_ai_processor.py
+DEEPOSEEK_NAMES_JSON = "./deepseek/deepseek_names.json"          # Output from deepseek_name_request.py
+DEEPOSEEK_JSON = "./deepseek/deepseek_response.json"             # Output from deepseek_request.py
+DEEPOSEEK_CHOLERA_JSON = "./deepseek/deepseek_yes_no_response.json"  # Output from deepseek_cholera_request.py
+GLOBAL_FILE = "./data/complete_data.json"
+
+# Ensure the global data directory exists
+os.makedirs(os.path.dirname(GLOBAL_FILE), exist_ok=True)
+
+def run_module(module_name):
+    """
+    Imports the given module and calls its main() function.
+    """
+    print(f"Running {module_name}...")
+    try:
+        module = importlib.import_module(module_name)
+        if hasattr(module, 'main'):
+            module.main()
+        else:
+            print(f"Module {module_name} does not have a main() function.")
+    except Exception as e:
+        print(f"Error running {module_name}: {e}")
+        traceback.print_exc()
+        exit(1)
+    print(f"{module_name} completed.\n")
+    # Small delay to ensure file writes are finished
+    time.sleep(1)
+
+def main():
+    # Step 1: Run historical_vital_records_downloader.py
+    run_module("historical_vital_records_downloader")
+
+    # Step 2: Run document_ai_processor.py
+    run_module("document_ai_processor")
+
+    # Step 2.5: Run deepseek_name_request.py
+    run_module("deepseek_name_request")
+
+    # Step 3: Run deepseek_request.py
+    run_module("deepseek_request")
+
+    # Step 4: Run deepseek_cholera_request.py
+    run_module("deepseek_cholera_request")
+
+    print("Pipeline processing complete. Global file updated at:", GLOBAL_FILE)
+    
+    # Run cholera processing module to copy PDFs and update JSON with cholera death records
+    cholera_processor.process_cholera_deaths()
+
+if __name__ == "__main__":
+    main()
+
+

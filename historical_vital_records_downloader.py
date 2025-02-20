@@ -24,9 +24,9 @@ from global_updater import update_global_file
 # -----------------------------
 # Configuration
 # -----------------------------
-MAX_FILES = None  # Set to 1, 50, or 0/None for no limit
+MAX_FILES = 1  # Set to 1, 50, or 0/None for no limit
 CERTIFICATES_PER_PAGE = None  # Positive int for limit; 0/None => process all
-MAX_PAGES = 12  # 0/None for no limit
+MAX_PAGES = 1  # 0/None for no limit
 
 BOROUGH = "manhattan"   # e.g., "manhattan", "kings", "queens", "bronx", "richmond"
 START_YEAR = 1865
